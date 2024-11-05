@@ -4,32 +4,26 @@ import numpy as np
 import pandas as pd
 import torch
 import torchvision.transforms as transforms
+from rdkit import Chem
+from rdkit.Chem import Draw
 from PIL import Image
-from sklearn import model_selection
+from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 from utils import mask_utils
 
 
-def load_pretraining_dataset(dataroot, dataset, val_size):
+def load_pretraining_dataset(dataset, val_size):
     '''
 
-    :param dataroot: e.g. ./datasets/pretraining/
-    :param dataset: e.g. toy or data
+    :param dataset: path to the csv file
     :param val_size: [0, 1]
-    :return:
+    :return: train_df, val_df
     '''
-    img_root = os.path.join(dataroot, dataset, "224")
-    csv_file = os.path.join(dataroot, dataset, "{}_for_pretrain.csv".format(dataset))
 
-    df = pd.read_csv(csv_file)
-    names = [os.path.join(img_root, filename) for filename in df["filename"]]
-    labels = np.c_[df["k_100"].values, df["k_1000"], df["k_10000"]].tolist()
+    df = pd.read_csv(dataset)
+    train_df, val_df = train_test_split(df, test_size=val_size, shuffle=True)
 
-    name_train, name_val, labels_train, labels_val = model_selection.train_test_split(names, labels,
-                                                                                      test_size=val_size,
-                                                                                      shuffle=True)
-
-    return name_train, name_val, labels_train, labels_val
+    return train_df, val_df
 
 
 def concatPILImage(patches):
@@ -47,13 +41,12 @@ def concatPILImage(patches):
 
 
 class JigsawDataset(Dataset):
-    def __init__(self, names, labels, jig_classes=100, img_transformer=None, tile_transformer=None,
+    def __init__(self, df, jig_classes=100, img_transformer=None, tile_transformer=None,
                  bias_whole_image=None, normalize=None, args=None):
         self.args = args
-        self.names = names
-        self.labels = labels
+        self.df = df
 
-        self.N = len(self.names)
+        self.N = len(self.df)
         self.permutations = self.__retrieve_permutations(jig_classes)
         self.grid_size = 3
         self.bias_whole_image = bias_whole_image
@@ -72,9 +65,24 @@ class JigsawDataset(Dataset):
         return tile
 
     def get_image(self, index):
-        framename = self.names[index]
-        img = Image.open(framename).convert('RGB')
-        return self._image_transformer(img)
+        
+        row = self.df.iloc[index]
+        smiles = row['smiles']
+
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            img = Draw.MolsToGridImage([mol], molsPerRow=1, subImgSize=(224, 224))
+            img = img.convert('RGB')
+        except Exception as e:
+            print(f"Cannot convert SMILES to image: {smiles}. Error: {e}. Creating a dummy image.")
+            img = Image.new('RGB', (224, 224))
+
+        if self._image_transformer is not None:
+            img = self._image_transformer(img)
+        else:
+            img = self.toTensor(img)
+
+        return img
 
     def get_tile_data(self, img, index):
         img = img.resize((222, 222))
@@ -97,7 +105,7 @@ class JigsawDataset(Dataset):
         data = concatPILImage(data).resize((224, 224))
         data = self._augment_tile(data)
 
-        return data, int(order), self.labels[index]
+        return data, int(order)
 
     def get_mask_data(self, data_non_mask, data64_non_mask,
                       mask_type, mask_shape_h, mask_shape_w, mask_ratio):
@@ -135,7 +143,7 @@ class JigsawDataset(Dataset):
         img = self.get_image(index)
         img64 = img.resize((64, 64))
 
-        data, order, label = self.get_tile_data(img, index)
+        data, order = self.get_tile_data(img, index)
 
         # get mask data
         data_non_mask = self._augment_tile(img)
@@ -151,10 +159,10 @@ class JigsawDataset(Dataset):
             data_non_mask = self.normalize(data_non_mask)
             cl_data_mask, cl_data64_mask = self.normalize(cl_data_mask), self.normalize(cl_data64_mask)
 
-        return data, order, label, data_non_mask, data64_non_mask, cl_data_mask, cl_data64_mask
+        return data, order, data_non_mask, data64_non_mask, cl_data_mask, cl_data64_mask
 
     def __len__(self):
-        return len(self.names)
+        return self.N
 
     def __retrieve_permutations(self, classes):
 

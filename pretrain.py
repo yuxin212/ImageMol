@@ -247,13 +247,13 @@ def main(args):
     # load data
     normalize, img_tra, tile_tra = load_norm_transform()
 
-    name_train, name_val, labels_train, labels_val = load_pretraining_dataset(args.dataroot, args.dataset, val_size)
-    train_dataset = JigsawDataset(name_train, labels_train, img_transformer=transforms.Compose(img_tra),
+    train_df, val_df = load_pretraining_dataset(args.dataroot, args.dataset, val_size)
+    train_dataset = JigsawDataset(train_df, img_transformer=transforms.Compose(img_tra),
                                   tile_transformer=transforms.Compose(tile_tra),
                                   bias_whole_image=original_image_rate,
                                   normalize=normalize,
                                   args=args)
-    val_dataset = JigsawDataset(name_val, labels_val, img_transformer=transforms.Compose(img_tra),
+    val_dataset = JigsawDataset(val_df, img_transformer=transforms.Compose(img_tra),
                                 tile_transformer=transforms.Compose(tile_tra),
                                 bias_whole_image=original_image_rate,
                                 normalize=normalize,
