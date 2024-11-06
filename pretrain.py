@@ -4,7 +4,9 @@ from datetime import datetime
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
-import torch.nn.parallel
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 import torch.optim
 import torch.utils.data
 import torchvision.transforms as transforms
@@ -13,7 +15,6 @@ from dataloader.JigsawLoader import JigsawDataset, load_pretraining_dataset
 from model.feat2image_model import generator, netlocalD
 from model.model import ImageMol, Matcher
 from model.train_utils import fix_train_random_seed
-from utils.public_utils import setup_device
 
 
 def load_norm_transform():
@@ -36,7 +37,6 @@ def parse_args():
     parser.add_argument('--lr', default=0.01, type=float, help='learning rate (default: 0.01)')
     parser.add_argument('--wd', default=-5, type=float, help='weight decay pow (default: -5)')
     parser.add_argument('--workers', default=2, type=int, help='number of data loading workers (default: 2)')
-    parser.add_argument('--val_workers', default=16, type=int, help='number of data loading workers (default: 16)')
     parser.add_argument('--epochs', type=int, default=151, help='number of total epochs to run (default: 151)')
     parser.add_argument('--start_epoch', default=0, type=int,
                         help='manual epoch number (useful on restarts) (default: 0)')
@@ -45,19 +45,16 @@ def parse_args():
     parser.add_argument('--checkpoints', type=int, default=1,
                         help='how many iterations between two checkpoints (default: 1)')
     parser.add_argument('--seed', type=int, default=31, help='random seed (default: 31)')
-    parser.add_argument('--dataroot', type=str, default="./datasets/pretraining/", help='data root')
-    parser.add_argument('--dataset', type=str, default="toy", help='dataset name, e.g. data, toy')
+    parser.add_argument('--dataset', type=str, help='dataset path (csv file)')
     parser.add_argument('--ckpt_dir', default='./ckpts/pretrain_model', help='path to checkpoint')
     parser.add_argument('--modelname', type=str, default="ResNet18", choices=["ResNet18"], help='supported model')
     parser.add_argument('--verbose', action='store_true', help='')
-    parser.add_argument('--ngpu', type=int, default=8, help='number of GPUs to use')
-    parser.add_argument('--gpu', type=str, default="0", help='GPUs of CUDA_VISIBLE_DEVICES')
     parser.add_argument('--nc', type=int, default=3)
     parser.add_argument('--ndf', type=int, default=64)
     parser.add_argument('--imageSize', type=int, default=224, help='the height / width of the input image to network')
     parser.add_argument('--Jigsaw_lambda', type=float, default=1,
                         help='start JPP task, 1 means start, 0 means not start')
-    parser.add_argument('--cluster_lambda', type=float, default=1, help='start M3GC task')
+    parser.add_argument('--cluster_lambda', type=float, default=0, help='start M3GC task')
     parser.add_argument('--constractive_lambda', type=float, default=0, help='start MCL task')
     parser.add_argument('--matcher_lambda', type=float, default=0, help='start MRD task')
     parser.add_argument('--is_recover_training', type=int, default=1, help='start MIR task')
@@ -186,9 +183,12 @@ def eval(args, dataloader, model, matcher, netG, netD, criterionBCE, criterion_m
 def main(args):
     start_time = datetime.now()
 
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    local_rank = int(os.environ['LOCAL_RANK'])
+    global_rank = int(os.environ['RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
 
-    device, device_ids = setup_device(args.ngpu)
+    # setup device
+    dist.init_process_group(backend='nccl', world_size=world_size)
 
     # fix random seeds
     fix_train_random_seed(args.seed)
@@ -214,17 +214,10 @@ def main(args):
     print(netG)
     print(netD)
 
-    if len(device_ids) > 1:
-        print("starting multi-gpu.")
-        model = torch.nn.DataParallel(model, device_ids=device_ids)
-        matcher = torch.nn.DataParallel(matcher, device_ids=device_ids)
-        netG = torch.nn.DataParallel(netG, device_ids=device_ids)
-        netD = torch.nn.DataParallel(netD, device_ids=device_ids)
-
-    model = model.cuda()
-    matcher = matcher.cuda()
-    netG = netG.cuda()
-    netD = netD.cuda()
+    model = model.to(local_rank)
+    matcher = matcher.to(local_rank)
+    netG = netG.to(local_rank)
+    netD = netD.to(local_rank)
 
     cudnn.benchmark = True
 
@@ -239,6 +232,11 @@ def main(args):
     optimizerD = torch.optim.Adam(netD.parameters(), lr=1e-3, betas=(0.5, 0.999))
     optimizerG = torch.optim.Adam(netG.parameters(), lr=1e-3, betas=(0.5, 0.999))
 
+    model = DDP(model, device_ids=[local_rank])
+    matcher = DDP(matcher, device_ids=[local_rank])
+    netG = DDP(netG, device_ids=[local_rank])
+    netD = DDP(netD, device_ids=[local_rank])
+
     # define loss function
     criterion = torch.nn.CrossEntropyLoss().cuda()
     criterion_matcher = torch.nn.NLLLoss().cuda()
@@ -247,7 +245,7 @@ def main(args):
     # load data
     normalize, img_tra, tile_tra = load_norm_transform()
 
-    train_df, val_df = load_pretraining_dataset(args.dataroot, args.dataset, val_size)
+    train_df, val_df = load_pretraining_dataset(args.dataset, val_size)
     train_dataset = JigsawDataset(train_df, img_transformer=transforms.Compose(img_tra),
                                   tile_transformer=transforms.Compose(tile_tra),
                                   bias_whole_image=original_image_rate,
@@ -262,12 +260,14 @@ def main(args):
                                                    batch_size=args.batch,
                                                    shuffle=True,
                                                    num_workers=args.workers,
+                                                   drop_last=True,
+                                                   sampler=DistributedSampler(train_dataset),
                                                    pin_memory=True)
     val_dataloader = torch.utils.data.DataLoader(val_dataset,
                                                  batch_size=args.batch,
                                                  shuffle=False,
-                                                 num_workers=args.val_workers,
-                                                 # sampler=sampler,
+                                                 num_workers=args.workers,
+                                                 sampler=DistributedSampler(val_dataset),
                                                  pin_memory=True)
 
     # starting to train
@@ -287,7 +287,7 @@ def main(args):
         AvgTotalLoss = 0
         with tqdm(total=len(train_dataloader)) as t:
             for i, (
-                    Jigsaw_img, Jigsaw_label, original_label, data_non_mask, data64_non_mask, cl_data_mask,
+                    Jigsaw_img, Jigsaw_label, data_non_mask, data64_non_mask, cl_data_mask,
                     _) in enumerate(
                 train_dataloader):
 
@@ -296,10 +296,6 @@ def main(args):
                 data_non_mask = torch.autograd.Variable(data_non_mask.cuda())
                 data64_non_mask = torch.autograd.Variable(data64_non_mask.cuda())
                 cl_data_mask = torch.autograd.Variable(cl_data_mask.cuda())
-
-                original_label1_var = torch.autograd.Variable(original_label[0].cuda())
-                original_label2_var = torch.autograd.Variable(original_label[1].cuda())
-                original_label3_var = torch.autograd.Variable(original_label[2].cuda())
 
                 hidden_feat, pre_Jigsaw_label, pre_class_label1, pre_class_label2, pre_class_label3 = model(
                     Jigsaw_img_var)
@@ -312,11 +308,6 @@ def main(args):
                 class_loss2 = torch.autograd.Variable(torch.Tensor([0.0])).cuda()
                 class_loss3 = torch.autograd.Variable(torch.Tensor([0.0])).cuda()
                 class_loss = torch.autograd.Variable(torch.Tensor([0.0])).cuda()
-                if args.cluster_lambda != 0:
-                    class_loss1 = criterion(pre_class_label1, original_label1_var)
-                    class_loss2 = criterion(pre_class_label2, original_label2_var)
-                    class_loss3 = criterion(pre_class_label3, original_label3_var)
-                    class_loss = class_loss1 + class_loss2 + class_loss3
 
                 hidden_feat_non_mask, _, _, _, _ = model(data_non_mask)
                 hidden_feat_mask, _, _, _, _ = model(cl_data_mask)
@@ -444,6 +435,7 @@ def main(args):
             torch.save({
                 'arch': args.modelname,
                 'state_dict': model_state_dict,
+                'evaluation': evaluationData,
             }, saveFile)
 
         print('Epoch: [{}][train]\t'
